@@ -30,9 +30,10 @@ Select with PHONE_HARNESS_BACKGROUND=1. Coordinates use the same global
 screen-point convention as the mirror backend and screen(), so every helper on
 top (tap_text, swipe, scroll_collect) works unchanged — just without focus.
 
-Keyboard (type_text/press) still briefly activates the window: the keyboard
-event-record layout isn't implemented yet, so those fall back to the mirror
-path. Mouse actions are fully background.
+Keyboard (type_text/press) briefly makes iPhone Mirroring the front process:
+pasted text does not arrive without it. It hands the user's app back after the
+key sequence, unless the user switched elsewhere meanwhile. Mouse actions are
+fully background.
 """
 import ctypes, ctypes.util, os, struct, subprocess, tempfile, time
 from contextlib import contextmanager
@@ -79,14 +80,63 @@ _KCPS_USER_GENERATED = 0x200
 
 
 def _front_process(psn, wid):
-    """Off by default: _SLPSSetFrontProcessWithOptions makes iPhone Mirroring
-    the front process. LaunchServices then reports it as the frontmost app
-    (the menu bar and Cmd shortcuts follow it), and its AXFrontmost stays true
-    after the user switches away, which is what mirror.activate() has to work
-    around with AXRaise. Taps, drags and keys land without it. Set
-    PHONE_HARNESS_FRONT_PROCESS=1 to bring it back if an update needs it."""
-    if os.environ.get("PHONE_HARNESS_FRONT_PROCESS") == "1":
+    """Off by default for mouse input: _SLPSSetFrontProcessWithOptions makes
+    iPhone Mirroring the front process. LaunchServices then reports it as the
+    frontmost app (the menu bar and Cmd shortcuts follow it), and its
+    AXFrontmost stays true after the user switches away, which is what
+    mirror.activate() has to work around with AXRaise. Taps and drags land
+    without it. Keyboard input does not (measured on macOS 27.2: Cmd+3 opened
+    Search but pasted text never arrived), so _keyboard_focus() turns it on
+    for the length of a key sequence. PHONE_HARNESS_FRONT_PROCESS=1 forces it
+    on for everything."""
+    if _keyboard_depth or os.environ.get("PHONE_HARNESS_FRONT_PROCESS") == "1":
         _sky._SLPSSetFrontProcessWithOptions(psn, wid, _KCPS_USER_GENERATED)
+
+
+_keyboard_depth = 0
+
+
+def _front_pid():
+    """PID of the app LaunchServices reports in front, or None.
+
+    NSWorkspace.frontmostApplication() is stale in a process without a run
+    loop (see mirror.focus_probe), so ask LaunchServices directly."""
+    try:
+        asn = subprocess.run(["lsappinfo", "front"], capture_output=True,
+                             text=True, timeout=2).stdout.strip()
+        out = subprocess.run(["lsappinfo", "info", "-only", "pid", asn],
+                             capture_output=True, text=True, timeout=2).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    digits = out.rsplit("=", 1)[-1].strip()
+    return int(digits) if digits.isdigit() else None
+
+
+def _activate_pid(pid):
+    app = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+    if app is not None:
+        app.activateWithOptions_(1 << 1)   # NSApplicationActivateIgnoringOtherApps
+
+
+@contextmanager
+def _keyboard_focus(pid):
+    """Borrow front-process status for a key sequence, then hand it back.
+
+    Hands back only when iPhone Mirroring is still in front at the end: if the
+    user switched to another app meanwhile, that app stays in front. Nested
+    calls (type_text -> paste -> press) borrow and hand back once."""
+    global _keyboard_depth
+    outer = _keyboard_depth == 0
+    prev = _front_pid() if outer else None
+    _keyboard_depth += 1
+    try:
+        yield
+    finally:
+        _keyboard_depth -= 1
+        if outer and prev is not None and prev != pid and _front_pid() == pid:
+            _activate_pid(prev)
+
+
 # CGSEventType values (share the CGEventType numbering)
 _LMOUSE_DOWN, _LMOUSE_UP, _LMOUSE_DRAGGED = 1, 2, 6
 
@@ -418,7 +468,8 @@ def _holding(pid, wid, mods):
 
 
 def press(combo):
-    """press('return'), press('cmd+1'), press('cmd+3') — no focus change."""
+    """press('return'), press('cmd+1'), press('cmd+3'). Borrows front-process
+    status for the keystroke and hands it back (see _keyboard_focus)."""
     pid, win = _ctx()
     parts = combo.lower().split("+")
     key, mods = parts[-1], parts[:-1]
@@ -427,32 +478,36 @@ def press(combo):
     for m in mods:
         if m not in mirror._MOD_KEYCODES:
             raise ValueError(f"unknown modifier {m!r}")
-    with _holding(pid, win["id"], mods) as flags:
+    with _keyboard_focus(pid), _holding(pid, win["id"], mods) as flags:
         _key(pid, win["id"], mirror._KEYCODES[key], flags)
 
 
 def _type_keystrokes(text, delay=0.03):
-    """Type via real keycodes, no focus change. Subject to iOS autocorrect,
-    which rewrites words as they are typed."""
+    """Type via real keycodes. Subject to iOS autocorrect, which rewrites
+    words as they are typed."""
     pid, win = _ctx()
-    for i, line in enumerate(text.split("\n")):
-        if i:
-            _key(pid, win["id"], mirror._KEYCODES["return"])
-        for ch in line:
-            code, shifted = mirror._keycode_for(ch)
-            if code is None:
-                raise ValueError(f"cannot type {ch!r} via keycodes")
-            with _holding(pid, win["id"], ["shift"] if shifted else []) as flags:
-                _key(pid, win["id"], code, flags)
-            time.sleep(delay)
+    with _keyboard_focus(pid):
+        for i, line in enumerate(text.split("\n")):
+            if i:
+                _key(pid, win["id"], mirror._KEYCODES["return"])
+            for ch in line:
+                code, shifted = mirror._keycode_for(ch)
+                if code is None:
+                    raise ValueError(f"cannot type {ch!r} via keycodes")
+                with _holding(pid, win["id"], ["shift"] if shifted else []) as flags:
+                    _key(pid, win["id"], code, flags)
+                time.sleep(delay)
 
 
 def type_text(text, delay=0.03, keystrokes=False):
-    """Type into the focused iOS field, no focus change.
+    """Type into the focused iOS field.
 
     Pastes by default so the text arrives exactly as written, past autocorrect
     and keyboard layout both. keystrokes=True sends real key events instead.
+    Either way front-process status is borrowed once for the whole text.
     """
     if keystrokes or not text:
         return _type_keystrokes(text, delay)
-    mirror.paste_with(press, text)
+    pid, _win = _ctx()
+    with _keyboard_focus(pid):
+        mirror.paste_with(press, text)
