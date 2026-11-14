@@ -505,9 +505,47 @@ def _holding(pid, wid, mods):
             _key_edge(pid, wid, mirror._MOD_KEYCODES[m], False, acc)
 
 
+def _menu_item(pid, combo):
+    """The iPhone Mirroring menu item bound to `combo`, or None.
+
+    View > Home Screen (cmd+1), App Switcher (cmd+2), Spotlight (cmd+3) and
+    Control Center (cmd+4) are ordinary Mac menu items. AXPress on them works
+    while another app stays in front (measured on macOS 27.2), so these
+    shortcuts need no keyboard focus at all. Only plain cmd+<char> is mapped:
+    AXMenuItemCmdModifiers 0 means Command alone."""
+    parts = combo.lower().split("+")
+    if parts[:-1] != ["cmd"] or len(parts[-1]) != 1:
+        return None
+    char = parts[-1].upper()
+    _AS = mirror._AS
+
+    def attr(el, name):
+        err, val = _AS.AXUIElementCopyAttributeValue(el, name, None)
+        return None if err else val
+
+    bar = attr(_AS.AXUIElementCreateApplication(pid), "AXMenuBar")
+    for top in attr(bar, "AXChildren") or []:
+        for menu in attr(top, "AXChildren") or []:
+            for item in attr(menu, "AXChildren") or []:
+                if (attr(item, "AXMenuItemCmdChar") == char
+                        and attr(item, "AXMenuItemCmdModifiers") == 0
+                        and attr(item, "AXEnabled")):
+                    return item
+    return None
+
+
+# Menu items that only move the phone between system screens. cmd+v, cmd+a
+# and friends stay on the key path: their Mac menu items are disabled while
+# the phone has the text field, so AXPress would silently do nothing.
+_MENU_COMBOS = {"cmd+1", "cmd+2", "cmd+3", "cmd+4"}
+
+
 def press(combo):
-    """press('return'), press('cmd+1'), press('cmd+3'). Borrows the front for
-    the keystroke and hands it back (see _keyboard_focus)."""
+    """press('return'), press('cmd+1'), press('cmd+3').
+
+    Home/App Switcher/Spotlight/Control Center go through the app's own menu
+    items with no focus change. Other keys borrow the front for the keystroke
+    and hand it back (see _keyboard_focus)."""
     pid, win = _ctx()
     parts = combo.lower().split("+")
     key, mods = parts[-1], parts[:-1]
@@ -516,6 +554,10 @@ def press(combo):
     for m in mods:
         if m not in mirror._MOD_KEYCODES:
             raise ValueError(f"unknown modifier {m!r}")
+    if combo.lower() in _MENU_COMBOS and _keyboard_depth == 0:
+        item = _menu_item(pid, combo)
+        if item is not None and mirror._AS.AXUIElementPerformAction(item, "AXPress") == 0:
+            return
     with _keyboard_focus(pid, win["id"]), _holding(pid, win["id"], mods) as flags:
         _key(pid, win["id"], mirror._KEYCODES[key], flags)
 
