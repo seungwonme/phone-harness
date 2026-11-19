@@ -12,7 +12,7 @@ import ApplicationServices as _AS
 from pathlib import Path
 
 import Quartz
-from AppKit import NSRunningApplication
+from AppKit import NSRunningApplication, NSWorkspace
 
 APP_NAME = "iPhone Mirroring"
 BUNDLE_ID = "com.apple.ScreenContinuity"
@@ -125,9 +125,30 @@ def interruption(before, after):
     return {"raised": bool(raised), "stole_focus": bool(a_front and not b_front)}
 
 
-def running_app():
+def _lookup_running_app():
     apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(BUNDLE_ID)
-    return apps[0] if apps else None
+    if apps:
+        return apps[0]
+    # A second query path: the bundle-id lookup has returned an empty list for
+    # an app whose pid was alive, seconds before the same call found it again.
+    for app in NSWorkspace.sharedWorkspace().runningApplications():
+        if app.bundleIdentifier() == BUNDLE_ID:
+            return app
+    return None
+
+
+def running_app(recheck_delay=0.3):
+    """The iPhone Mirroring app, or None when it is not running.
+
+    One bounded re-check after `recheck_delay` before answering None, so a
+    transient empty answer is not reported as "would not launch". A real
+    not-running costs one extra short wait.
+    """
+    app = _lookup_running_app()
+    if app is None and recheck_delay:
+        time.sleep(recheck_delay)
+        app = _lookup_running_app()
+    return app
 
 
 def window_ax_content():
